@@ -3,9 +3,12 @@ import os
 import sqlite3
 import telebot
 import numpy as np
+import time
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.apihelper import ApiTelegramException
 
 import random
+
 def generate_captcha():
     operators = ['+', '-', '*', '/']
     num1 = random.randint(1, 10)
@@ -27,8 +30,34 @@ load_dotenv(dotenv_path='config.env')
 # Токен для бота
 API_TOKEN = os.getenv('TELEGRAM_API_TOKEN')
 
-# Инициализация бота
-bot = telebot.TeleBot(API_TOKEN, skip_pending=True)
+# Проверяем, что токен установлен
+if not API_TOKEN:
+    raise ValueError("❌ Токен не найден! Установите TELEGRAM_API_TOKEN в config.env или в переменных окружения Render")
+
+# Инициализация бота с увеличенным таймаутом
+bot = telebot.TeleBot(API_TOKEN, skip_pending=True, timeout=60)
+
+# === ПРИНУДИТЕЛЬНЫЙ СБРОС СОСТОЯНИЯ ===
+print("🔄 Выполняю принудительный сброс состояния...")
+
+# 1. Удаляем webhook
+try:
+    bot.remove_webhook()
+    print("✅ Webhook удален")
+except Exception as e:
+    print(f"⚠️ Ошибка удаления webhook: {e}")
+
+# 2. Очищаем все обновления
+try:
+    updates = bot.get_updates(offset=-1, timeout=10)
+    print(f"✅ Очищено {len(updates)} обновлений")
+except Exception as e:
+    print(f"⚠️ Ошибка очистки обновлений: {e}")
+
+# 3. Пауза для завершения процессов
+time.sleep(2)
+
+print("🚀 Бот готов к запуску!")
 
 # Список администраторов по ID и username
 ADMIN_USERNAMES = ['Sub_Pielea_Mea']
@@ -381,6 +410,36 @@ def admin_help(message):
     """
     send_message(message.chat.id, help_message)
 
-# Запуск бота
-bot.remove_webhook()
-bot.polling(none_stop=True)
+# === ЗАПУСК БОТА С ПОВТОРНЫМИ ПОПЫТКАМИ ===
+print("🔄 Запускаю бота с обработкой ошибок...")
+
+while True:
+    try:
+        # Удаляем webhook перед запуском
+        bot.remove_webhook()
+        print("✅ Webhook удален перед запуском")
+        
+        # Запускаем polling
+        print("🚀 Бот запущен и работает!")
+        bot.polling(none_stop=True, interval=0, timeout=60)
+        
+    except ApiTelegramException as e:
+        if "Conflict" in str(e):
+            print("⚠️ Конфликт экземпляров. Перезапуск через 10 секунд...")
+            time.sleep(10)
+            # Пытаемся сбросить состояние
+            try:
+                bot.remove_webhook()
+                bot.get_updates(offset=-1)
+                print("✅ Состояние сброшено")
+            except Exception as reset_error:
+                print(f"⚠️ Ошибка сброса: {reset_error}")
+            continue
+        else:
+            print(f"❌ Ошибка Telegram API: {e}")
+            time.sleep(5)
+            
+    except Exception as e:
+        print(f"❌ Неизвестная ошибка: {e}")
+        print("🔄 Перезапуск через 5 секунд...")
+        time.sleep(5)
