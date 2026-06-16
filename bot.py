@@ -20,10 +20,12 @@ def generate_captcha():
     return captcha, int(answer)
 
 load_dotenv(dotenv_path='config.env')
-API_TOKEN = os.getenv('TELEGRAM_API_TOKEN')
+
+# === ИСПРАВЛЕНО: ИСПОЛЬЗУЕМ BOT_TOKEN ===
+API_TOKEN = os.getenv('BOT_TOKEN')
 
 if not API_TOKEN:
-    raise ValueError("❌ Токен не найден!")
+    raise ValueError("❌ Токен не найден! Проверьте переменную BOT_TOKEN")
 
 # Инициализация бота
 bot = telebot.TeleBot(API_TOKEN)
@@ -47,8 +49,17 @@ print("🚀 Бот готов к запуску!")
 
 # ===== КОНФИГУРАЦИЯ =====
 ADMIN_USERNAMES = ['Sub_Pielea_Mea']
-REQUIRED_CHANNELS = ['@test1_PythonPI', '@test2_PythonPI']
+REQUIRED_CHANNELS = ['@vestiminska']  # ← ИЗМЕНЕНО: только один канал
 MAX_WINNERS = 1
+
+# ===== ТЕКСТЫ =====
+WELCOME_TEXT = (
+    f'<b>Добро пожаловать в "Мой Бот"!</b>\n\n'
+    f'🔥 Здесь вы найдете всё о новостях и событиях.\n\n'
+    f'📢 Мы создаем сообщество единомышленников:\n\n'
+    f'🔗 <a href="https://t.me/vestiminska">НОВОСТИ ДНЯ</a>\n\n'
+    f'✨ Чтобы быть в курсе всех событий и получать награды 🎁, подпишитесь на наши каналы и нажмите "Участвовать".'
+)
 
 # ===== БАЗА ДАННЫХ =====
 def execute_query(query, parameters=()):
@@ -93,22 +104,14 @@ def start(message):
         subscribed, _ = check_subscriptions(user_id)
         if not subscribed:
             photo_path = 'fashion_welcome.jpg'
-            message_text = (
-                f'<b>Добро пожаловать в "FashionBot"!</b>\n\n'
-                f'💄 Здесь вы найдете всё о моде, стиле и вдохновении.\n\n'
-                f'🌸 Мы создаем атмосферу красоты и утонченности:\n\n'
-                f'🔗 <a href="https://t.me/test1_PythonPI">БЛЕСК И ШЁПОТ</a>\n'
-                f'🔗 <a href="https://t.me/test2_PythonPI">МИР АРОМАТОВ</a>\n\n'
-                f'✨ Чтобы полностью раскрыть ваш стиль и получить вознаграждение 🎁, подпишитесь на наши каналы и нажмите "Участвовать".'
-            )
             markup = InlineKeyboardMarkup()
             participate_button = InlineKeyboardButton(text="🎉 Участвовать", callback_data="participate")
             markup.add(participate_button)
             try:
                 with open(photo_path, 'rb') as photo:
-                    bot.send_photo(message.chat.id, photo, caption=message_text, parse_mode='HTML', reply_markup=markup)
+                    bot.send_photo(message.chat.id, photo, caption=WELCOME_TEXT, parse_mode='HTML', reply_markup=markup)
             except Exception as e:
-                bot.send_message(message.chat.id, message_text, parse_mode='HTML', reply_markup=markup)
+                bot.send_message(message.chat.id, WELCOME_TEXT, parse_mode='HTML', reply_markup=markup)
         else:
             bot.send_message(message.chat.id, '⚠️ Вы уже зарегистрированы в конкурсе.', parse_mode='HTML')
     else:
@@ -140,23 +143,16 @@ def captcha_check(msg):
                     return
             else:
                 execute_query("INSERT INTO users (telegram_id, referral_code, inviter, invites_count) VALUES (?, ?, ?, ?)", (user_id, referral_link, None, 0))
+            
             photo_path = 'fashion_welcome.jpg'
-            message_text = (
-                f'<b>Добро пожаловать в "FashionBot"!</b>\n\n'
-                f'💄 Здесь вы найдете всё о моде, стиле и вдохновении.\n\n'
-                f'🌸 Мы создаем атмосферу красоты и утонченности:\n\n'
-                f'🔗 <a href="https://t.me/test1_PythonPI">БЛЕСК И ШЁПОТ</a>\n'
-                f'🔗 <a href="https://t.me/test2_PythonPI">МИР АРОМАТОВ</a>\n\n'
-                f'✨ Чтобы полностью раскрыть ваш стиль и получить вознаграждение 🎁, подпишитесь на наши каналы и нажмите "Участвовать".'
-            )
             markup = InlineKeyboardMarkup()
             participate_button = InlineKeyboardButton(text="🎉 Участвовать", callback_data="participate")
             markup.add(participate_button)
             try:
                 with open(photo_path, 'rb') as photo:
-                    bot.send_photo(msg.chat.id, photo, caption=message_text, parse_mode='HTML', reply_markup=markup)
+                    bot.send_photo(msg.chat.id, photo, caption=WELCOME_TEXT, parse_mode='HTML', reply_markup=markup)
             except Exception:
-                bot.send_message(msg.chat.id, message_text, parse_mode='HTML', reply_markup=markup)
+                bot.send_message(msg.chat.id, WELCOME_TEXT, parse_mode='HTML', reply_markup=markup)
         else:
             bot.send_message(msg.chat.id, "❌ Неверный ответ на капчу. Попробуйте снова.")
     except ValueError:
