@@ -21,7 +21,7 @@ def generate_captcha():
 
 load_dotenv(dotenv_path='config.env')
 
-# === ИСПРАВЛЕНО: ИСПОЛЬЗУЕМ BOT_TOKEN ===
+# === ИСПОЛЬЗУЕМ BOT_TOKEN ===
 API_TOKEN = os.getenv('BOT_TOKEN')
 
 if not API_TOKEN:
@@ -49,7 +49,7 @@ print("🚀 Бот готов к запуску!")
 
 # ===== КОНФИГУРАЦИЯ =====
 ADMIN_USERNAMES = ['Sub_Pielea_Mea']
-REQUIRED_CHANNELS = ['@vestiminska']  # ← ИЗМЕНЕНО: только один канал
+REQUIRED_CHANNELS = ['@vestiminska']
 MAX_WINNERS = 1
 
 # ===== ТЕКСТЫ =====
@@ -174,7 +174,10 @@ def participate(call):
         return
     execute_query("UPDATE users SET particip = 1 WHERE telegram_id = ?", (user_id,))
     referral_code = execute_query("SELECT referral_code FROM users WHERE telegram_id = ?", (user_id,)).fetchone()[0]
-    invite_link = f'https://t.me/APD52_bot?start={referral_code}'
+    
+    # === ИЗМЕНЕНО: НОВОЕ ИМЯ БОТА ===
+    invite_link = f'https://t.me/refererbottg_bot?start={referral_code}'
+    
     photo_path_2 = 'fashion_welcome2.jpg'
     message_text_2 = (
         '🎉 <b>Поздравляю со вступлением</b>\n\n'
