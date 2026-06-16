@@ -2,32 +2,18 @@ from dotenv import load_dotenv
 import os
 import sqlite3
 import telebot
-import numpy as np
 import time
+import random
+import string
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.apihelper import ApiTelegramException
-import random
-
-def generate_captcha():
-    operators = ['+', '-', '*', '/']
-    num1 = random.randint(1, 10)
-    num2 = random.randint(1, 10)
-    operator = random.choice(operators)
-    if operator == '/':
-        num1 = num1 * num2
-    captcha = f"{num1} {operator} {num2}"
-    answer = eval(captcha)
-    return captcha, int(answer)
 
 load_dotenv(dotenv_path='config.env')
 
-# === ИСПОЛЬЗУЕМ BOT_TOKEN ===
 API_TOKEN = os.getenv('BOT_TOKEN')
-
 if not API_TOKEN:
     raise ValueError("❌ Токен не найден! Проверьте переменную BOT_TOKEN")
 
-# Инициализация бота
 bot = telebot.TeleBot(API_TOKEN)
 
 # === ПРИНУДИТЕЛЬНЫЙ СБРОС ===
@@ -49,265 +35,296 @@ print("🚀 Бот готов к запуску!")
 
 # ===== КОНФИГУРАЦИЯ =====
 ADMIN_USERNAMES = ['Sub_Pielea_Mea']
-REQUIRED_CHANNELS = ['@vestiminska']
-MAX_WINNERS = 1
-
-# ===== ТЕКСТЫ =====
-WELCOME_TEXT = (
-    f'<b>Добро пожаловать в "Мой Бот"!</b>\n\n'
-    f'🔥 Здесь вы найдете всё о новостях и событиях.\n\n'
-    f'📢 Мы создаем сообщество единомышленников:\n\n'
-    f'🔗 <a href="https://t.me/vestiminska">НОВОСТИ ДНЯ</a>\n\n'
-    f'✨ Чтобы быть в курсе всех событий и получать награды 🎁, подпишитесь на наши каналы и нажмите "Участвовать".'
-)
+CHANNEL_USERNAME = '@vestiminska'  # Ваш канал
+GOAL_INVITES = 5  # Цель: пригласить 5 человек
+PRIZE_MESSAGE = "🎁 ПОЗДРАВЛЯЮ! Вы пригласили 5 человек и получаете ПРИЗ!"
 
 # ===== БАЗА ДАННЫХ =====
+DB_PATH = os.path.join('/app/data', 'database.db')
+
+def init_db():
+    """Создает таблицы, если их нет"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        
+        # Таблица пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                invite_code TEXT UNIQUE,
+                invites_count INTEGER DEFAULT 0,
+                prize_received INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Таблица приглашенных
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inviter_id INTEGER,
+                invited_id INTEGER,
+                invited_username TEXT,
+                invited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (inviter_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        conn.commit()
+        print("✅ База данных инициализирована")
+
 def execute_query(query, parameters=()):
-    with sqlite3.connect('database.db') as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(query, parameters)
         conn.commit()
         return cursor
 
-# ===== ПРОВЕРКИ =====
-def is_admin(message):
-    username = message.from_user.username
-    return username and username in ADMIN_USERNAMES
+# Инициализируем базу при запуске
+init_db()
+
+# ===== ФУНКЦИИ =====
+def generate_invite_code():
+    """Генерирует уникальный код для приглашения"""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+def get_user(user_id):
+    """Получает пользователя из базы"""
+    result = execute_query(
+        "SELECT user_id, username, invite_code, invites_count, prize_received FROM users WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+    return result
+
+def create_user(user_id, username):
+    """Создает нового пользователя с уникальным кодом"""
+    invite_code = generate_invite_code()
+    execute_query(
+        "INSERT INTO users (user_id, username, invite_code, invites_count, prize_received) VALUES (?, ?, ?, ?, ?)",
+        (user_id, username, invite_code, 0, 0)
+    )
+    return invite_code
+
+def get_invite_link(user_id):
+    """Генерирует пригласительную ссылку для пользователя"""
+    user = get_user(user_id)
+    if not user:
+        return None
+    
+    invite_code = user[2]
+    # Ссылка на бота с параметром invite_code
+    return f"https://t.me/refererbottg_bot?start={invite_code}"
+
+def process_invite(invite_code, new_user_id, new_username):
+    """Обрабатывает переход по пригласительной ссылке"""
+    # Находим пригласившего по коду
+    inviter = execute_query(
+        "SELECT user_id FROM users WHERE invite_code = ?",
+        (invite_code,)
+    ).fetchone()
+    
+    if not inviter:
+        return False, "Пригласительный код не найден"
+    
+    inviter_id = inviter[0]
+    
+    # Проверяем, не пригласил ли пользователь сам себя
+    if inviter_id == new_user_id:
+        return False, "Нельзя пригласить самого себя"
+    
+    # Проверяем, не был ли уже приглашен этот пользователь
+    existing_invite = execute_query(
+        "SELECT id FROM invites WHERE invited_id = ?",
+        (new_user_id,)
+    ).fetchone()
+    
+    if existing_invite:
+        return False, "Этот пользователь уже был приглашен"
+    
+    # Проверяем, подписан ли новый пользователь на канал
+    if not is_subscribed(new_user_id, CHANNEL_USERNAME):
+        return False, "Пользователь не подписан на канал"
+    
+    # Записываем приглашение
+    execute_query(
+        "INSERT INTO invites (inviter_id, invited_id, invited_username) VALUES (?, ?, ?)",
+        (inviter_id, new_user_id, new_username)
+    )
+    
+    # Увеличиваем счетчик у пригласившего
+    execute_query(
+        "UPDATE users SET invites_count = invites_count + 1 WHERE user_id = ?",
+        (inviter_id,)
+    )
+    
+    # Проверяем, достиг ли пригласивший цели
+    inviter_data = get_user(inviter_id)
+    invites_count = inviter_data[3]
+    prize_received = inviter_data[4]
+    
+    if invites_count >= GOAL_INVITES and prize_received == 0:
+        # Отмечаем, что приз получен
+        execute_query(
+            "UPDATE users SET prize_received = 1 WHERE user_id = ?",
+            (inviter_id,)
+        )
+        
+        # Отправляем поздравление пригласившему
+        try:
+            bot.send_message(
+                inviter_id,
+                f"🎉 ПОЗДРАВЛЯЮ!\n\n"
+                f"Вы пригласили {invites_count} человек в канал {CHANNEL_USERNAME}!\n\n"
+                f"{PRIZE_MESSAGE}"
+            )
+        except Exception as e:
+            print(f"Не удалось отправить поздравление {inviter_id}: {e}")
+    
+    return True, f"Приглашение засчитано! У {inviter_id} теперь {invites_count} приглашений"
 
 def is_subscribed(user_id, channel_id):
+    """Проверяет, подписан ли пользователь на канал"""
     try:
         status = bot.get_chat_member(channel_id, user_id).status
         return status in ['member', 'administrator', 'creator']
-    except Exception:
+    except Exception as e:
+        print(f"Ошибка проверки подписки: {e}")
         return False
 
-def check_subscriptions(user_id):
-    for channel in REQUIRED_CHANNELS:
-        if not is_subscribed(user_id, channel):
-            return False, channel
-    return True, None
-
-def send_message(chat_id, text):
-    bot.send_message(chat_id, text)
-
 # ===== КОМАНДЫ =====
-user_cache = {}
-
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
-    print(f"✅ Получена команда /start от {user_id}")
+    username = message.from_user.username or str(user_id)
     
-    does_exist = bool(execute_query("SELECT telegram_id FROM users WHERE telegram_id = ?", (user_id,)).fetchone())
+    # Разбираем параметры команды
+    args = message.text.split()
+    invite_code = args[1] if len(args) > 1 else None
     
-    if does_exist:
-        subscribed, _ = check_subscriptions(user_id)
-        if not subscribed:
-            photo_path = 'fashion_welcome.jpg'
-            markup = InlineKeyboardMarkup()
-            participate_button = InlineKeyboardButton(text="🎉 Участвовать", callback_data="participate")
-            markup.add(participate_button)
-            try:
-                with open(photo_path, 'rb') as photo:
-                    bot.send_photo(message.chat.id, photo, caption=WELCOME_TEXT, parse_mode='HTML', reply_markup=markup)
-            except Exception as e:
-                bot.send_message(message.chat.id, WELCOME_TEXT, parse_mode='HTML', reply_markup=markup)
-        else:
-            bot.send_message(message.chat.id, '⚠️ Вы уже зарегистрированы в конкурсе.', parse_mode='HTML')
-    else:
-        captcha_question, captcha_answer = generate_captcha()
-        user_cache[user_id] = {"captcha_answer": captcha_answer, "message": message}
-        bot.send_message(message.chat.id, f"Чтобы начать, решите капчу: {captcha_question} = ?\nВведите ваш ответ:")
-
-@bot.message_handler(func=lambda msg: msg.from_user.id in user_cache)
-def captcha_check(msg):
-    user_id = msg.from_user.id
-    original_message = user_cache[user_id]["message"]
-    try:
-        user_answer = int(msg.text)
-        if user_answer == user_cache[user_id]["captcha_answer"]:
-            bot.send_message(msg.chat.id, "✅ Капча пройдена успешно!")
-            del user_cache[user_id]
-            args = original_message.text.split()
-            referral_link = f'ref_{user_id}'
-            if len(args) > 1:
-                ref_code = args[1]
-                inviter = execute_query("SELECT telegram_id FROM users WHERE referral_code = ?", (ref_code,)).fetchone()
-                if inviter:
-                    inviter_id = inviter[0]
-                    execute_query("UPDATE users SET invites_count = invites_count + 1 WHERE telegram_id = ?", (inviter_id,))
-                    execute_query("INSERT INTO users (telegram_id, referral_code, inviter, invites_count) VALUES (?, ?, ?, ?)", (user_id, referral_link, inviter_id, 0))
-                    bot.send_message(inviter_id, f"🎉 У вас новый реферал: {user_id}!")
-                else:
-                    bot.send_message(msg.chat.id, "❌ Неверный реферальный код.")
-                    return
+    # Проверяем, есть ли пользователь в базе
+    user = get_user(user_id)
+    
+    if not user:
+        # Создаем нового пользователя
+        new_code = create_user(user_id, username)
+        
+        # Если есть invite_code, обрабатываем приглашение
+        if invite_code:
+            success, msg = process_invite(invite_code, user_id, username)
+            if not success:
+                bot.send_message(user_id, f"❌ {msg}")
             else:
-                execute_query("INSERT INTO users (telegram_id, referral_code, inviter, invites_count) VALUES (?, ?, ?, ?)", (user_id, referral_link, None, 0))
-            
-            photo_path = 'fashion_welcome.jpg'
-            markup = InlineKeyboardMarkup()
-            participate_button = InlineKeyboardButton(text="🎉 Участвовать", callback_data="participate")
-            markup.add(participate_button)
-            try:
-                with open(photo_path, 'rb') as photo:
-                    bot.send_photo(msg.chat.id, photo, caption=WELCOME_TEXT, parse_mode='HTML', reply_markup=markup)
-            except Exception:
-                bot.send_message(msg.chat.id, WELCOME_TEXT, parse_mode='HTML', reply_markup=markup)
+                bot.send_message(user_id, f"✅ {msg}")
+        
+        # Отправляем приветственное сообщение
+        welcome_text = (
+            f"👋 Добро пожаловать!\n\n"
+            f"Твой уникальный код для приглашения: `{new_code}`\n\n"
+            f"🔗 Приглашай друзей:\n"
+            f"`https://t.me/refererbottg_bot?start={new_code}`\n\n"
+            f"📊 Статистика: 0/{GOAL_INVITES} приглашений\n\n"
+            f"🎯 Пригласи {GOAL_INVITES} человек в канал {CHANNEL_USERNAME} и получи приз!"
+        )
+        bot.send_message(user_id, welcome_text, parse_mode='Markdown')
+    
+    else:
+        # Пользователь уже есть
+        user_id, username, invite_code, invites_count, prize_received = user
+        
+        status_text = f"📊 Твоя статистика:\n\n"
+        status_text += f"👥 Приглашено: {invites_count}/{GOAL_INVITES}\n"
+        status_text += f"🔗 Твоя ссылка:\n`https://t.me/refererbottg_bot?start={invite_code}`\n\n"
+        
+        if prize_received == 1:
+            status_text += f"🎁 Вы уже получили приз за {GOAL_INVITES} приглашений!"
+        elif invites_count >= GOAL_INVITES:
+            status_text += f"🎉 Вы достигли цели! Напишите администратору для получения приза."
         else:
-            bot.send_message(msg.chat.id, "❌ Неверный ответ на капчу. Попробуйте снова.")
-    except ValueError:
-        bot.send_message(msg.chat.id, "❌ Пожалуйста, введите число.")
+            status_text += f"🎯 Пригласи еще {GOAL_INVITES - invites_count} человек и получи приз!"
+        
+        bot.send_message(user_id, status_text, parse_mode='Markdown')
 
-@bot.callback_query_handler(func=lambda call: call.data == "participate")
-def participate(call):
-    user_id = call.from_user.id
-    user = execute_query("SELECT particip FROM users WHERE telegram_id = ?", (user_id,)).fetchone()
-    if user is None:
-        bot.answer_callback_query(call.id, text='❌ Вы не зарегистрированы. Используйте /start для начала.', show_alert=True)
-        return
-    subscribed, _ = check_subscriptions(user_id)
-    if not subscribed:
-        bot.answer_callback_query(call.id, text='⚠️ Вы не подписаны на все каналы. Подпишитесь, чтобы участвовать!', show_alert=True)
-        return
-    if user[0] == 1:
-        bot.answer_callback_query(call.id, text='⚠️ Вы уже участвуете в конкурсе.', show_alert=True)
-        return
-    execute_query("UPDATE users SET particip = 1 WHERE telegram_id = ?", (user_id,))
-    referral_code = execute_query("SELECT referral_code FROM users WHERE telegram_id = ?", (user_id,)).fetchone()[0]
+@bot.message_handler(commands=['link'])
+def get_link(message):
+    """Отправляет ссылку для приглашения"""
+    user_id = message.from_user.id
+    link = get_invite_link(user_id)
+    if link:
+        bot.send_message(
+            user_id,
+            f"🔗 Твоя пригласительная ссылка:\n`{link}`\n\n"
+            f"📤 Отправь ее друзьям, чтобы они подписались на {CHANNEL_USERNAME}!",
+            parse_mode='Markdown'
+        )
+    else:
+        bot.send_message(user_id, "❌ Ты не зарегистрирован. Напиши /start")
+
+@bot.message_handler(commands=['stats'])
+def stats(message):
+    """Показывает статистику пользователя"""
+    user_id = message.from_user.id
+    user = get_user(user_id)
     
-    # === ИЗМЕНЕНО: НОВОЕ ИМЯ БОТА ===
-    invite_link = f'https://t.me/refererbottg_bot?start={referral_code}'
+    if not user:
+        bot.send_message(user_id, "❌ Ты не зарегистрирован. Напиши /start")
+        return
     
-    photo_path_2 = 'fashion_welcome2.jpg'
-    message_text_2 = (
-        '🎉 <b>Поздравляю со вступлением</b>\n\n'
-        f'❗️ Вот твоя уникальная ссылка:\n<a>{invite_link}</a>\n\n'
-        'Приглашай по ней своих друзей, получай за каждого один билет, копи максимум билетов и увеличивай свои шансы на выигрыш!🏆'
-    )
-    try:
-        with open(photo_path_2, 'rb') as photo:
-            bot.send_photo(call.message.chat.id, photo, caption=message_text_2, parse_mode='HTML')
-    except Exception:
-        bot.send_message(call.message.chat.id, message_text_2, parse_mode='HTML')
-    bot.answer_callback_query(call.id, text='🎉 Вы успешно зарегистрировались!', show_alert=True)
+    user_id, username, invite_code, invites_count, prize_received = user
+    
+    stats_text = f"📊 Твоя статистика:\n\n"
+    stats_text += f"👤 ID: {user_id}\n"
+    stats_text += f"👥 Приглашено: {invites_count}/{GOAL_INVITES}\n"
+    stats_text += f"🔗 Код: `{invite_code}`\n\n"
+    
+    if prize_received == 1:
+        stats_text += f"🎁 Приз уже получен!"
+    elif invites_count >= GOAL_INVITES:
+        stats_text += f"🎉 Поздравляю! Ты выполнил цель! Обратись к администратору."
+    else:
+        stats_text += f"🎯 Осталось пригласить: {GOAL_INVITES - invites_count} чел."
+    
+    # Показываем список приглашенных
+    invites_list = execute_query(
+        "SELECT invited_username, invited_at FROM invites WHERE inviter_id = ? ORDER BY invited_at DESC LIMIT 10",
+        (user_id,)
+    ).fetchall()
+    
+    if invites_list:
+        stats_text += f"\n\n📋 Последние приглашенные:\n"
+        for i, (invited_username, invited_at) in enumerate(invites_list, 1):
+            stats_text += f"{i}. @{invited_username or 'скрыт'} ({invited_at[:10]})\n"
+    
+    bot.send_message(user_id, stats_text, parse_mode='Markdown')
 
 # ===== АДМИН-КОМАНДЫ =====
-@bot.message_handler(commands=['set_winners'])
-def set_winners(message):
-    if not is_admin(message):
-        send_message(message.chat.id, 'У вас нет прав для выполнения этой команды.')
+@bot.message_handler(commands=['admin_stats'])
+def admin_stats(message):
+    """Показывает общую статистику (только для админов)"""
+    if message.from_user.username not in ADMIN_USERNAMES:
+        bot.send_message(message.chat.id, "❌ У вас нет прав для выполнения этой команды.")
         return
-    try:
-        new_winners_count = int(message.text.split()[1])
-        global MAX_WINNERS
-        MAX_WINNERS = new_winners_count
-        send_message(message.chat.id, f"Количество победителей успешно изменено на {MAX_WINNERS}.")
-    except (IndexError, ValueError):
-        send_message(message.chat.id, "Пожалуйста, укажите корректное количество победителей. Пример: /set_winners 3")
-
-@bot.message_handler(commands=['draw'])
-def draw_raffle(message):
-    if not is_admin(message):
-        bot.send_message(message.chat.id, '❌ У вас нет прав для выполнения этой команды.')
-        return
-    all_partic = execute_query("SELECT telegram_id, invites_count FROM users WHERE invites_count >= 1").fetchall()
-    if not all_partic:
-        bot.send_message(message.chat.id, '❌ Нет участников, которые соответствуют условиям для розыгрыша.')
-        return
-    total_invites = sum([pair[1] for pair in all_partic])
-    users = [pair[0] for pair in all_partic]
-    probs = [pair[1] / total_invites for pair in all_partic]
-    max_winners = min(len(users), MAX_WINNERS)
-    if max_winners == 0:
-        bot.send_message(message.chat.id, '❌ Недостаточно участников для выбора победителей.')
-        return
-    winners = np.random.choice(users, size=max_winners, replace=False, p=probs)
-    winners_message = ''
-    for winner in winners:
-        try:
-            chat = bot.get_chat(winner)
-            username = f'@{chat.username}' if chat.username else 'Без имени пользователя'
-            winners_message += f'Победитель: {username} (ID: {winner})\n'
-        except Exception:
-            winners_message += f'Победитель: ID {winner} (не удалось получить имя пользователя)\n'
-    bot.send_message(message.chat.id, f'🎉 Розыгрыш завершен! Победители:\n{winners_message}')
-
-@bot.message_handler(commands=['participants'])
-def show_participants(message):
-    if not is_admin(message):
-        send_message(message.chat.id, 'У вас нет прав для выполнения этой команды.')
-        return
-    users = execute_query("SELECT telegram_id, invites_count, inviter FROM users ORDER BY invites_count DESC").fetchall()
-    if not users:
-        send_message(message.chat.id, 'Нет зарегистрированных пользователей.')
-        return
-    participants_message = "Участники конкурса:\n"
-    for user in users:
-        telegram_id, invites_count, inviter = user
-        if invites_count:
-            try:
-                username = bot.get_chat(telegram_id).username
-                participants_message += f"ID:{telegram_id}, UserName:@{username},Added:{invites_count}:\n"
-                n = 1
-                for user_invited in users:
-                    telegram_id_invited, _, inviter_20 = user_invited
-                    if telegram_id == inviter_20 and telegram_id != telegram_id_invited:
-                        try:
-                            username2 = bot.get_chat(telegram_id_invited).username
-                            participants_message += f"\t{n}. ID:{telegram_id_invited}, UserName:@{username2}\n"
-                            n += 1
-                        except:
-                            pass
-            except Exception:
-                participants_message += f"ID:{telegram_id},Added:{invites_count}:\n"
-    send_message(message.chat.id, participants_message)
-
-@bot.message_handler(commands=['help_adm'])
-def admin_help(message):
-    if not is_admin(message):
-        send_message(message.chat.id, 'У вас нет прав для выполнения этой команды.')
-        return
-    help_message = """
-    Список команд для администраторов:
-    /help_adm - Показать этот список команд.
-    /set_winners [число] - Установить количество победителей в розыгрыше.
-    /draw - Провести розыгрыш.
-    /participants - Показать участников конкурса и количество приглашенных.
-    /delete_user [telegram_id] - Удалить пользователя по его ID.
-    /reset_users - Удалить всех пользователей.
-    """
-    send_message(message.chat.id, help_message)
-
-@bot.message_handler(commands=['delete_user'])
-def delete_user(message):
-    if not is_admin(message):
-        send_message(message.chat.id, 'У вас нет прав для выполнения этой команды.')
-        return
-    try:
-        telegram_id = int(message.text.split()[1])
-    except (IndexError, ValueError):
-        send_message(message.chat.id, 'Пожалуйста, укажите корректный telegram_id. Пример: /delete_user 123456789')
-        return
-    user = execute_query("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
-    if not user:
-        send_message(message.chat.id, f'Пользователь с ID {telegram_id} не найден.')
-    else:
-        inviter_of_user = user[4]
-        try:
-            execute_query("UPDATE users SET invites_count = invites_count - 1 WHERE telegram_id = ?", (inviter_of_user,))
-            execute_query("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
-            execute_query("UPDATE users SET particip = 0 WHERE invites_count < 1")
-            send_message(message.chat.id, f'Пользователь с ID {telegram_id} был удален.')
-        except:
-            pass
-
-@bot.message_handler(commands=['reset_users'])
-def reset_users(message):
-    if not is_admin(message):
-        send_message(message.chat.id, 'У вас нет прав для выполнения этой команды.')
-        return
-    execute_query("DELETE FROM users")
-    send_message(message.chat.id, 'Все пользователи были удалены.')
+    
+    total_users = execute_query("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_invites = execute_query("SELECT COUNT(*) FROM invites").fetchone()[0]
+    prize_winners = execute_query("SELECT COUNT(*) FROM users WHERE prize_received = 1").fetchone()[0]
+    
+    stats_text = f"📊 Общая статистика:\n\n"
+    stats_text += f"👥 Всего пользователей: {total_users}\n"
+    stats_text += f"🔗 Всего приглашений: {total_invites}\n"
+    stats_text += f"🎁 Получили приз: {prize_winners}\n"
+    
+    # Топ пригласивших
+    top_inviters = execute_query(
+        "SELECT user_id, username, invites_count FROM users ORDER BY invites_count DESC LIMIT 10"
+    ).fetchall()
+    
+    if top_inviters:
+        stats_text += f"\n🏆 Топ пригласивших:\n"
+        for i, (user_id, username, invites_count) in enumerate(top_inviters, 1):
+            stats_text += f"{i}. @{username or str(user_id)}: {invites_count} чел.\n"
+    
+    bot.send_message(message.chat.id, stats_text)
 
 # ===== ЗАПУСК =====
 print("🚀 Запускаю бота...")
@@ -320,7 +337,6 @@ while True:
     except ApiTelegramException as e:
         if "409" in str(e) or "Conflict" in str(e):
             print(f"⚠️ Конфликт: {e}")
-            print("🔄 Перезапуск через 5 секунд...")
             time.sleep(5)
             continue
         else:
@@ -328,5 +344,4 @@ while True:
             time.sleep(5)
     except Exception as e:
         print(f"❌ Ошибка: {e}")
-        print("🔄 Перезапуск через 5 секунд...")
         time.sleep(5)
