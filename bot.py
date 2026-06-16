@@ -32,25 +32,40 @@ API_TOKEN = os.getenv('TELEGRAM_API_TOKEN')
 if not API_TOKEN:
     raise ValueError("❌ Токен не найден! Установите TELEGRAM_API_TOKEN в config.env или в переменных окружения Render")
 
-# Инициализация бота (без timeout в конструкторе)
-bot = telebot.TeleBot(API_TOKEN, skip_pending=True)
+# === ПРИНУДИТЕЛЬНОЕ УДАЛЕНИЕ WEBHOOK ===
+print("🔄 Выполняю принудительное удаление webhook...")
 
-# === ПРИНУДИТЕЛЬНЫЙ СБРОС СОСТОЯНИЯ ===
-print("🔄 Выполняю принудительный сброс состояния...")
+# Создаем бота ДО ВСЕХ ОПЕРАЦИЙ
+bot = telebot.TeleBot(API_TOKEN)
 
+# Удаляем webhook
 try:
     bot.remove_webhook()
-    print("✅ Webhook удален")
+    print("✅ Webhook успешно удален")
 except Exception as e:
     print(f"⚠️ Ошибка удаления webhook: {e}")
 
+# Ждем 2 секунды для завершения
+time.sleep(2)
+
+# Проверяем статус
+try:
+    webhook_info = bot.get_webhook_info()
+    print(f"📡 Текущий webhook: {webhook_info.url}")
+    if webhook_info.url:
+        print("⚠️ Webhook все еще активен! Повторная попытка...")
+        bot.remove_webhook()
+        time.sleep(1)
+except Exception as e:
+    print(f"⚠️ Не удалось получить статус webhook: {e}")
+
+# Очищаем обновления
 try:
     updates = bot.get_updates(offset=-1, timeout=10)
     print(f"✅ Очищено {len(updates)} обновлений")
 except Exception as e:
     print(f"⚠️ Ошибка очистки обновлений: {e}")
 
-time.sleep(2)
 print("🚀 Бот готов к запуску!")
 
 # Список администраторов по ID и username
@@ -369,21 +384,22 @@ print("🔄 Запускаю бота с обработкой ошибок...")
 
 while True:
     try:
+        # ЕЩЕ РАЗ УДАЛЯЕМ WEBHOOK ПЕРЕД ЗАПУСКОМ
         bot.remove_webhook()
         print("✅ Webhook удален перед запуском")
         
-        # Запускаем polling с таймаутом
         print("🚀 Бот запущен и работает!")
         bot.polling(none_stop=True, interval=0, timeout=60)
         
     except ApiTelegramException as e:
-        if "Conflict" in str(e):
-            print("⚠️ Конфликт экземпляров. Перезапуск через 10 секунд...")
+        if "Conflict" in str(e) or "webhook" in str(e):
+            print(f"⚠️ Ошибка: {e}")
+            print("🔄 Повторная попытка удаления webhook через 10 секунд...")
             time.sleep(10)
             try:
                 bot.remove_webhook()
-                bot.get_updates(offset=-1)
-                print("✅ Состояние сброшено")
+                print("✅ Webhook удален")
+                time.sleep(2)
             except Exception as reset_error:
                 print(f"⚠️ Ошибка сброса: {reset_error}")
             continue
