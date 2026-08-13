@@ -1,347 +1,711 @@
-from dotenv import load_dotenv
+# -*- coding: utf-8 -*-
+
 import os
-import sqlite3
-import telebot
-import time
-import random
-import string
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from telebot.apihelper import ApiTelegramException
+import re
+import logging
+import sys
+import tempfile
+import subprocess
+from io import BytesIO
+from typing import Optional, List
+import traceback
+import asyncio
 
-load_dotenv(dotenv_path='config.env')
-
-API_TOKEN = os.getenv('BOT_TOKEN')
-if not API_TOKEN:
-    raise ValueError("❌ Токен не найден! Проверьте переменную BOT_TOKEN")
-
-bot = telebot.TeleBot(API_TOKEN)
-
-# === ПРИНУДИТЕЛЬНЫЙ СБРОС ===
-print("🔄 Принудительный сброс состояния...")
+# Проверяем и устанавливаем необходимые библиотеки
 try:
-    bot.remove_webhook()
-    print("✅ Webhook удален")
-except Exception as e:
-    print(f"⚠️ Ошибка удаления webhook: {e}")
+    import httpx
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "httpx"])
+    import httpx
 
 try:
-    updates = bot.get_updates(offset=-1, timeout=10)
-    print(f"✅ Очищено {len(updates)} обновлений")
-except Exception as e:
-    print(f"⚠️ Ошибка очистки обновлений: {e}")
+    import requests
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
 
-time.sleep(2)
-print("🚀 Бот готов к запуску!")
-
-# ===== КОНФИГУРАЦИЯ =====
-ADMIN_USERNAMES = ['Sub_Pielea_Mea']
-CHANNEL_USERNAME = '@vestiminska'  # Ваш канал
-GOAL_INVITES = 5  # Цель: пригласить 5 человек
-PRIZE_MESSAGE = "🎁 ПОЗДРАВЛЯЮ! Вы пригласили 5 человек и получаете ПРИЗ!"
-
-# ===== БАЗА ДАННЫХ =====
-DB_PATH = os.path.join('/app/data', 'database.db')
-
-def init_db():
-    """Создает таблицы, если их нет"""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        
-        # Таблица пользователей
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                invite_code TEXT UNIQUE,
-                invites_count INTEGER DEFAULT 0,
-                prize_received INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Таблица приглашенных
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS invites (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                inviter_id INTEGER,
-                invited_id INTEGER,
-                invited_username TEXT,
-                invited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (inviter_id) REFERENCES users (user_id)
-            )
-        ''')
-        
-        conn.commit()
-        print("✅ База данных инициализирована")
-
-def execute_query(query, parameters=()):
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(query, parameters)
-        conn.commit()
-        return cursor
-
-# Инициализируем базу при запуске
-init_db()
-
-# ===== ФУНКЦИИ =====
-def generate_invite_code():
-    """Генерирует уникальный код для приглашения"""
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-
-def get_user(user_id):
-    """Получает пользователя из базы"""
-    result = execute_query(
-        "SELECT user_id, username, invite_code, invites_count, prize_received FROM users WHERE user_id = ?",
-        (user_id,)
-    ).fetchone()
-    return result
-
-def create_user(user_id, username):
-    """Создает нового пользователя с уникальным кодом"""
-    invite_code = generate_invite_code()
-    execute_query(
-        "INSERT INTO users (user_id, username, invite_code, invites_count, prize_received) VALUES (?, ?, ?, ?, ?)",
-        (user_id, username, invite_code, 0, 0)
-    )
-    return invite_code
-
-def get_invite_link(user_id):
-    """Генерирует пригласительную ссылку для пользователя"""
-    user = get_user(user_id)
-    if not user:
-        return None
-    
-    invite_code = user[2]
-    # Ссылка на бота с параметром invite_code
-    return f"https://t.me/refererbottg_bot?start={invite_code}"
-
-def process_invite(invite_code, new_user_id, new_username):
-    """Обрабатывает переход по пригласительной ссылке"""
-    # Находим пригласившего по коду
-    inviter = execute_query(
-        "SELECT user_id FROM users WHERE invite_code = ?",
-        (invite_code,)
-    ).fetchone()
-    
-    if not inviter:
-        return False, "Пригласительный код не найден"
-    
-    inviter_id = inviter[0]
-    
-    # Проверяем, не пригласил ли пользователь сам себя
-    if inviter_id == new_user_id:
-        return False, "Нельзя пригласить самого себя"
-    
-    # Проверяем, не был ли уже приглашен этот пользователь
-    existing_invite = execute_query(
-        "SELECT id FROM invites WHERE invited_id = ?",
-        (new_user_id,)
-    ).fetchone()
-    
-    if existing_invite:
-        return False, "Этот пользователь уже был приглашен"
-    
-    # Проверяем, подписан ли новый пользователь на канал
-    if not is_subscribed(new_user_id, CHANNEL_USERNAME):
-        return False, "Пользователь не подписан на канал"
-    
-    # Записываем приглашение
-    execute_query(
-        "INSERT INTO invites (inviter_id, invited_id, invited_username) VALUES (?, ?, ?)",
-        (inviter_id, new_user_id, new_username)
-    )
-    
-    # Увеличиваем счетчик у пригласившего
-    execute_query(
-        "UPDATE users SET invites_count = invites_count + 1 WHERE user_id = ?",
-        (inviter_id,)
-    )
-    
-    # Проверяем, достиг ли пригласивший цели
-    inviter_data = get_user(inviter_id)
-    invites_count = inviter_data[3]
-    prize_received = inviter_data[4]
-    
-    if invites_count >= GOAL_INVITES and prize_received == 0:
-        # Отмечаем, что приз получен
-        execute_query(
-            "UPDATE users SET prize_received = 1 WHERE user_id = ?",
-            (inviter_id,)
-        )
-        
-        # Отправляем поздравление пригласившему
+# Правильный импорт moviepy
+try:
+    from moviepy import VideoFileClip, ImageSequenceClip
+    from moviepy.video.fx import resize
+    from moviepy.video.compositing.concatenate import concatenate_videoclips
+    from moviepy.audio.io.AudioFileClip import AudioFileClip
+except ImportError:
+    try:
+        from moviepy.video.io.VideoFileClip import VideoFileClip
+        from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
+        from moviepy.video.compositing.concatenate import concatenate_videoclips
+        from moviepy.audio.io.AudioFileClip import AudioFileClip
         try:
-            bot.send_message(
-                inviter_id,
-                f"🎉 ПОЗДРАВЛЯЮ!\n\n"
-                f"Вы пригласили {invites_count} человек в канал {CHANNEL_USERNAME}!\n\n"
-                f"{PRIZE_MESSAGE}"
+            from moviepy.video.fx import resize
+        except:
+            resize = None
+    except:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "moviepy==1.0.3"])
+        from moviepy.video.io.VideoFileClip import VideoFileClip
+        from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
+        from moviepy.video.compositing.concatenate import concatenate_videoclips
+        from moviepy.audio.io.AudioFileClip import AudioFileClip
+        try:
+            from moviepy.video.fx import resize
+        except:
+            resize = None
+
+try:
+    import numpy as np
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy"])
+    import numpy as np
+
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+from telegram import Bot, Update
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+
+# ==================== НАСТРОЙКИ ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SOURCE_CHANNEL_ID = os.getenv("SOURCE_CHANNEL_ID")  # Канал, откуда берем посты
+TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID")  # Канал, куда публикуем
+
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не настроен!")
+if not SOURCE_CHANNEL_ID:
+    raise ValueError("❌ SOURCE_CHANNEL_ID не настроен!")
+if not TARGET_CHANNEL_ID:
+    raise ValueError("❌ TARGET_CHANNEL_ID не настроен!")
+
+try:
+    SOURCE_CHANNEL_ID = int(SOURCE_CHANNEL_ID)
+    TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID)
+except ValueError:
+    raise ValueError("❌ SOURCE_CHANNEL_ID и TARGET_CHANNEL_ID должны быть числами!")
+
+# НАСТРОЙКИ СТИЛЯ (ЧП ВМ)
+TARGET_W, TARGET_H = 720, 900
+CHP_GRADIENT_PCT = 0.48
+MN_TITLE_ZONE_PCT = 0.23
+BRIGHTNESS_FACTOR = 0.85
+FONT_CHP = "Montserrat-Black.ttf"
+FONT_FALLBACK = "Arial.ttf"
+
+# ==================== ЛОГИРОВАНИЕ ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ==================== ФУНКЦИИ ДЛЯ ШРИФТОВ ====================
+
+def download_fonts():
+    """Скачивание шрифтов"""
+    fonts_urls = {
+        "Montserrat-Black.ttf": "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Black.ttf",
+        "Arial.ttf": "https://github.com/matomo-org/travis-scripts/raw/master/fonts/Arial.ttf",
+    }
+    for font_name, url in fonts_urls.items():
+        if not os.path.exists(font_name):
+            try:
+                logger.info(f"⬇️ Скачивание шрифта {font_name}...")
+                response = requests.get(url, timeout=30)
+                if response.status_code == 200:
+                    with open(font_name, "wb") as f:
+                        f.write(response.content)
+                    logger.info(f"✅ Шрифт {font_name} скачан")
+            except Exception as e:
+                logger.error(f"❌ Ошибка скачивания {font_name}: {e}")
+
+def load_font(font_name: str, size: int):
+    """Загрузка шрифта"""
+    try:
+        return ImageFont.truetype(font_name, size=size)
+    except Exception:
+        try:
+            return ImageFont.truetype(FONT_FALLBACK, size=size)
+        except:
+            return ImageFont.load_default()
+
+# ==================== ФУНКЦИИ ОБРАБОТКИ ИЗОБРАЖЕНИЙ ====================
+
+def crop_to_ratio(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Обрезка изображения под нужное соотношение сторон"""
+    w, h = img.size
+    target_ratio = target_w / target_h
+    cur_ratio = w / h
+    
+    if cur_ratio > target_ratio:
+        new_w = int(h * target_ratio)
+        left = (w - new_w) // 2
+        return img.crop((left, 0, left + new_w, h))
+    else:
+        new_h = int(w / target_ratio)
+        top = (h - new_h) // 2
+        return img.crop((0, top, w, top + new_h))
+
+def apply_bottom_gradient(img: Image.Image, height_pct: float, max_alpha: int = 220) -> Image.Image:
+    """Применение градиента снизу"""
+    w, h = img.size
+    gh = int(h * height_pct)
+    if gh <= 0:
+        return img
+    
+    overlay_alpha = Image.new("L", (w, h), 0)
+    grad = Image.new("L", (1, gh), 0)
+    for y in range(gh):
+        a = int(max_alpha * (y / max(1, gh - 1)))
+        grad.putpixel((0, y), a)
+    grad = grad.resize((w, gh))
+    overlay_alpha.paste(grad, (0, h - gh))
+    
+    black = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+    base = img.convert("RGBA")
+    overlay = Image.composite(black, Image.new("RGBA", (w, h), (0, 0, 0, 0)), overlay_alpha)
+    out = Image.alpha_composite(base, overlay)
+    return out.convert("RGB")
+
+def text_width(draw, s: str, font) -> int:
+    """Ширина текста"""
+    try:
+        bbox = draw.textbbox((0, 0), s, font=font)
+        return bbox[2] - bbox[0]
+    except:
+        return len(s) * font.size // 2
+
+def wrap_text(draw, text: str, font, max_width: int, max_lines: int = 6):
+    """Перенос текста по словам"""
+    words = text.split()
+    if not words:
+        return [""], True
+    
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        test = current + " " + word
+        if text_width(draw, test, font) <= max_width:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) >= max_lines:
+                return lines, False
+    lines.append(current)
+    return lines, True
+
+def fit_text_block(draw, text: str, safe_w: int, max_block_h: int,
+                   max_lines: int = 6, start_size: int = 90, min_size: int = 16):
+    """Подбор размера шрифта для текста"""
+    text = (text or "").strip()
+    if not text:
+        text = " "
+    
+    size = start_size
+    while size >= min_size:
+        font = load_font(FONT_CHP, size)
+        lines, ok = wrap_text(draw, text, font, safe_w, max_lines=max_lines)
+        spacing = int(size * 0.22)
+        heights = []
+        total_h = 0
+        max_w = 0
+        for ln in lines:
+            try:
+                bb = draw.textbbox((0, 0), ln, font=font)
+                lw = bb[2] - bb[0]
+                lh = bb[3] - bb[1]
+            except:
+                lw = len(ln) * size // 2
+                lh = size
+            heights.append(lh)
+            total_h += lh
+            max_w = max(max_w, lw)
+        total_h += spacing * (len(lines) - 1)
+        if ok and max_w <= safe_w and total_h <= max_block_h:
+            return font, lines, heights, spacing, total_h
+        size -= 2
+    
+    font = load_font(FONT_CHP, min_size)
+    lines, _ = wrap_text(draw, text, font, safe_w, max_lines=max_lines)
+    spacing = int(min_size * 0.22)
+    heights = []
+    total_h = 0
+    for ln in lines:
+        try:
+            bb = draw.textbbox((0, 0), ln, font=font)
+            lh = bb[3] - bb[1]
+        except:
+            lh = min_size
+        heights.append(lh)
+        total_h += lh
+    total_h += spacing * (len(lines) - 1)
+    return font, lines, heights, spacing, total_h
+
+def clean_title_for_card(title: str) -> str:
+    """Очистка заголовка от эмодзи и лишних пробелов"""
+    if not title:
+        return ""
+    
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F700-\U0001F77F"
+        "\U0001F780-\U0001F7FF"
+        "\U0001F800-\U0001F8FF"
+        "\U0001F900-\U0001F9FF"
+        "\U0001FA00-\U0001FA6F"
+        "\U0001FA70-\U0001FAFF"
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "\u2600-\u27BF"
+        "]+",
+        flags=re.UNICODE
+    )
+    clean = emoji_pattern.sub('', title)
+    clean = re.sub(r'\s+', ' ', clean)
+    return clean.strip()
+
+def extract_title_from_text(text: str) -> str:
+    """Извлечение заголовка из текста"""
+    if not text:
+        return ""
+    
+    # Удаляем эмодзи
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F700-\U0001F77F"
+        "\U0001F780-\U0001F7FF"
+        "\U0001F800-\U0001F8FF"
+        "\U0001F900-\U0001F9FF"
+        "\U0001FA00-\U0001FA6F"
+        "\U0001FA70-\U0001FAFF"
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "\u2600-\u27BF"
+        "]+",
+        flags=re.UNICODE
+    )
+    clean_text = emoji_pattern.sub('', text).strip()
+    
+    # Если есть перенос строки - берем первую строку
+    if '\n' in clean_text:
+        lines = clean_text.split('\n')
+        title = lines[0].strip()
+        if len(title) > 200:
+            title = title[:197] + "..."
+        return title
+    
+    # Если есть точка и текст длинный - берем первое предложение
+    if '. ' in clean_text and len(clean_text) > 100:
+        parts = clean_text.split('. ', 1)
+        title = (parts[0] + '.').strip()
+        if len(title) > 200:
+            title = title[:197] + "..."
+        return title
+    
+    # Иначе берем весь текст
+    if len(clean_text) > 200:
+        return clean_text[:197] + "..."
+    return clean_text
+
+def process_image(img: Image.Image, title_text: str) -> Image.Image:
+    """Обработка изображения: обрезка, затемнение, градиент, текст"""
+    try:
+        # Обрезка под 4:5
+        img = crop_to_ratio(img, TARGET_W, TARGET_H)
+        img = img.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
+        
+        # Затемнение
+        img = ImageEnhance.Brightness(img).enhance(BRIGHTNESS_FACTOR)
+        
+        # Градиент снизу
+        img = apply_bottom_gradient(img, height_pct=CHP_GRADIENT_PCT, max_alpha=220)
+        
+        # Нанесение текста
+        draw = ImageDraw.Draw(img)
+        margin_x = int(img.width * 0.06)
+        margin_bottom = int(img.height * 0.08)
+        safe_w = img.width - 2 * margin_x
+        title_max_h = int(img.height * MN_TITLE_ZONE_PCT)
+        
+        clean_title = clean_title_for_card(title_text)
+        text = (clean_title or "Без заголовка").strip().upper()
+        
+        font, lines, heights, spacing, total_h = fit_text_block(
+            draw=draw, text=text, safe_w=safe_w,
+            max_block_h=title_max_h, max_lines=6,
+            start_size=int(img.height * 0.11), min_size=16
+        )
+        
+        line_height = font.size
+        total_text_height = len(lines) * line_height + (len(lines) - 1) * 2
+        
+        y = img.height - margin_bottom - total_text_height
+        
+        for ln in lines:
+            draw.text((margin_x, y), ln, font=font, fill="white")
+            y += line_height + 2
+        
+        return img
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки изображения: {e}")
+        return img
+
+def process_photo_bytes(photo_bytes: bytes, title_text: str) -> BytesIO:
+    """Обработка фото из байтов"""
+    try:
+        img = Image.open(BytesIO(photo_bytes)).convert("RGB")
+        img = process_image(img, title_text)
+        
+        output = BytesIO()
+        img.save(output, format="PNG")
+        output.seek(0)
+        return output
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки фото: {e}")
+        return BytesIO(photo_bytes)
+
+# ==================== ОБРАБОТКА ВИДЕО ====================
+
+def process_video_frame(frame: np.ndarray, title_text: str) -> np.ndarray:
+    """Обработка кадра видео"""
+    try:
+        img = Image.fromarray(frame).convert("RGB")
+        img = process_image(img, title_text)
+        return np.array(img)
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки кадра: {e}")
+        return frame
+
+def process_video_bytes(video_bytes: bytes, title_text: str) -> BytesIO:
+    """Обработка видео из байтов"""
+    temp_input = None
+    temp_output = None
+    
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as f:
+            f.write(video_bytes)
+            temp_input = f.name
+        
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as f:
+            temp_output = f.name
+        
+        logger.info(f"📹 Загрузка видео...")
+        video = VideoFileClip(temp_input)
+        logger.info(f"📹 Видео загружено: {video.duration}с, {video.size}")
+        
+        # Обработка всех кадров
+        def process_frame(frame):
+            return process_video_frame(frame, title_text)
+        
+        processed_video = video.fl_image(process_frame)
+        
+        # Сохраняем аудио
+        if video.audio is not None:
+            try:
+                logger.info(f"🎵 Сохраняем оригинальное аудио...")
+                processed_video = processed_video.set_audio(video.audio)
+                logger.info(f"✅ Оригинальное аудио сохранено")
+            except Exception as e:
+                logger.error(f"❌ Ошибка сохранения аудио: {e}")
+        
+        logger.info(f"💾 Сохранение видео...")
+        processed_video.write_videofile(
+            temp_output,
+            codec='libx264',
+            audio_codec='aac',
+            fps=video.fps,
+            bitrate='5000k',
+            threads=4,
+            preset='medium',
+            logger=None
+        )
+        
+        video.close()
+        processed_video.close()
+        
+        with open(temp_output, 'rb') as f:
+            result_bytes = f.read()
+        
+        logger.info(f"✅ Видео обработано! Размер: {len(result_bytes) / (1024*1024):.2f} MB")
+        
+        output = BytesIO()
+        output.write(result_bytes)
+        output.seek(0)
+        return output
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при обработке видео: {e}")
+        traceback.print_exc()
+        output = BytesIO(video_bytes)
+        output.seek(0)
+        return output
+    
+    finally:
+        try:
+            if temp_input and os.path.exists(temp_input):
+                os.unlink(temp_input)
+            if temp_output and os.path.exists(temp_output):
+                os.unlink(temp_output)
+        except:
+            pass
+
+# ==================== СКАЧИВАНИЕ МЕДИА ====================
+
+async def download_media(bot: Bot, file_id: str) -> Optional[bytes]:
+    """Скачивание медиа по file_id"""
+    try:
+        file = await bot.get_file(file_id)
+        
+        logger.info(f"📥 Скачивание, размер: {file.file_size / (1024*1024):.1f} MB" if file.file_size else "📥 Скачивание...")
+        result = await file.download_as_bytearray()
+        logger.info(f"✅ Скачано: {len(result) / (1024*1024):.1f} MB")
+        return bytes(result)
+    except Exception as e:
+        logger.error(f"❌ Ошибка скачивания: {e}")
+        return None
+
+def get_text_from_message(message) -> str:
+    """Получение текста из сообщения"""
+    return message.text or message.caption or ""
+
+# ==================== ОСНОВНАЯ ЛОГИКА ====================
+
+async def process_post(message, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка поста из канала"""
+    try:
+        logger.info(f"📨 Получен пост из канала")
+        
+        # Получаем текст
+        text = get_text_from_message(message)
+        
+        # Извлекаем заголовок
+        title = extract_title_from_text(text)
+        formatted_text = text
+        
+        # Определяем, что пришло: фото, видео или медиагруппа
+        has_photos = hasattr(message, 'photo') and message.photo
+        has_video = hasattr(message, 'video') and message.video
+        has_media_group = hasattr(message, 'media_group_id') and message.media_group_id
+        
+        # Если медиагруппа - берем только первое фото
+        if has_media_group and has_photos:
+            logger.info(f"📦 Медиагруппа, берем только первое фото")
+            # Если это медиагруппа, то обрабатываем только первое фото из группы
+            # Но в telegram API приходит каждое фото отдельно, поэтому проверяем media_group_id
+        
+        # Обработка фото
+        if has_photos and not has_media_group:
+            logger.info(f"📸 Обработка фото")
+            
+            # Берем самое качественное фото
+            photo = message.photo[-1]
+            photo_bytes = await download_media(context.bot, photo.file_id)
+            
+            if not photo_bytes:
+                logger.error("❌ Не удалось скачать фото")
+                return
+            
+            # Обрабатываем фото
+            processed = process_photo_bytes(photo_bytes, title)
+            
+            if not processed or len(processed.getvalue()) == 0:
+                logger.error("❌ Ошибка обработки фото")
+                return
+            
+            # Отправляем в целевой канал
+            caption = formatted_text if formatted_text else ""
+            if caption:
+                caption = caption[:1024]  # Telegram ограничение
+            
+            await context.bot.send_photo(
+                chat_id=TARGET_CHANNEL_ID,
+                photo=BytesIO(processed.getvalue()),
+                caption=caption,
+                parse_mode="HTML",
+                width=TARGET_W,
+                height=TARGET_H
             )
-        except Exception as e:
-            print(f"Не удалось отправить поздравление {inviter_id}: {e}")
-    
-    return True, f"Приглашение засчитано! У {inviter_id} теперь {invites_count} приглашений"
-
-def is_subscribed(user_id, channel_id):
-    """Проверяет, подписан ли пользователь на канал"""
-    try:
-        status = bot.get_chat_member(channel_id, user_id).status
-        return status in ['member', 'administrator', 'creator']
+            
+            logger.info(f"✅ Фото отправлено в канал {TARGET_CHANNEL_ID}")
+            return
+        
+        # Обработка видео
+        if has_video:
+            logger.info(f"📹 Обработка видео")
+            
+            video_bytes = await download_media(context.bot, message.video.file_id)
+            
+            if not video_bytes:
+                logger.error("❌ Не удалось скачать видео")
+                return
+            
+            # Обрабатываем видео
+            processed = process_video_bytes(video_bytes, title)
+            
+            if not processed or len(processed.getvalue()) == 0:
+                logger.error("❌ Ошибка обработки видео")
+                return
+            
+            # Отправляем в целевой канал
+            caption = formatted_text if formatted_text else ""
+            if caption:
+                caption = caption[:1024]  # Telegram ограничение
+            
+            await context.bot.send_video(
+                chat_id=TARGET_CHANNEL_ID,
+                video=BytesIO(processed.getvalue()),
+                caption=caption,
+                parse_mode="HTML",
+                width=TARGET_W,
+                height=TARGET_H
+            )
+            
+            logger.info(f"✅ Видео отправлено в канал {TARGET_CHANNEL_ID}")
+            return
+        
+        # Если нет медиа - просто пересылаем текст
+        if text and not has_photos and not has_video:
+            logger.info(f"📝 Текстовый пост")
+            await context.bot.send_message(
+                chat_id=TARGET_CHANNEL_ID,
+                text=text,
+                parse_mode="HTML"
+            )
+            logger.info(f"✅ Текст отправлен в канал {TARGET_CHANNEL_ID}")
+            return
+        
+        logger.info("ℹ️ Пост не содержит медиа, пропускаем")
+        
     except Exception as e:
-        print(f"Ошибка проверки подписки: {e}")
-        return False
+        logger.error(f"❌ Ошибка обработки поста: {e}")
+        traceback.print_exc()
 
-# ===== КОМАНДЫ =====
-@bot.message_handler(commands=['start'])
-def start(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or str(user_id)
-    
-    # Разбираем параметры команды
-    args = message.text.split()
-    invite_code = args[1] if len(args) > 1 else None
-    
-    # Проверяем, есть ли пользователь в базе
-    user = get_user(user_id)
-    
-    if not user:
-        # Создаем нового пользователя
-        new_code = create_user(user_id, username)
-        
-        # Если есть invite_code, обрабатываем приглашение
-        if invite_code:
-            success, msg = process_invite(invite_code, user_id, username)
-            if not success:
-                bot.send_message(user_id, f"❌ {msg}")
-            else:
-                bot.send_message(user_id, f"✅ {msg}")
-        
-        # Отправляем приветственное сообщение
-        welcome_text = (
-            f"👋 Добро пожаловать!\n\n"
-            f"Твой уникальный код для приглашения: `{new_code}`\n\n"
-            f"🔗 Приглашай друзей:\n"
-            f"`https://t.me/refererbottg_bot?start={new_code}`\n\n"
-            f"📊 Статистика: 0/{GOAL_INVITES} приглашений\n\n"
-            f"🎯 Пригласи {GOAL_INVITES} человек в канал {CHANNEL_USERNAME} и получи приз!"
-        )
-        bot.send_message(user_id, welcome_text, parse_mode='Markdown')
-    
-    else:
-        # Пользователь уже есть
-        user_id, username, invite_code, invites_count, prize_received = user
-        
-        status_text = f"📊 Твоя статистика:\n\n"
-        status_text += f"👥 Приглашено: {invites_count}/{GOAL_INVITES}\n"
-        status_text += f"🔗 Твоя ссылка:\n`https://t.me/refererbottg_bot?start={invite_code}`\n\n"
-        
-        if prize_received == 1:
-            status_text += f"🎁 Вы уже получили приз за {GOAL_INVITES} приглашений!"
-        elif invites_count >= GOAL_INVITES:
-            status_text += f"🎉 Вы достигли цели! Напишите администратору для получения приза."
-        else:
-            status_text += f"🎯 Пригласи еще {GOAL_INVITES - invites_count} человек и получи приз!"
-        
-        bot.send_message(user_id, status_text, parse_mode='Markdown')
-
-@bot.message_handler(commands=['link'])
-def get_link(message):
-    """Отправляет ссылку для приглашения"""
-    user_id = message.from_user.id
-    link = get_invite_link(user_id)
-    if link:
-        bot.send_message(
-            user_id,
-            f"🔗 Твоя пригласительная ссылка:\n`{link}`\n\n"
-            f"📤 Отправь ее друзьям, чтобы они подписались на {CHANNEL_USERNAME}!",
-            parse_mode='Markdown'
-        )
-    else:
-        bot.send_message(user_id, "❌ Ты не зарегистрирован. Напиши /start")
-
-@bot.message_handler(commands=['stats'])
-def stats(message):
-    """Показывает статистику пользователя"""
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    
-    if not user:
-        bot.send_message(user_id, "❌ Ты не зарегистрирован. Напиши /start")
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик постов из канала-источника"""
+    message = update.channel_post
+    if not message:
         return
     
-    user_id, username, invite_code, invites_count, prize_received = user
-    
-    stats_text = f"📊 Твоя статистика:\n\n"
-    stats_text += f"👤 ID: {user_id}\n"
-    stats_text += f"👥 Приглашено: {invites_count}/{GOAL_INVITES}\n"
-    stats_text += f"🔗 Код: `{invite_code}`\n\n"
-    
-    if prize_received == 1:
-        stats_text += f"🎁 Приз уже получен!"
-    elif invites_count >= GOAL_INVITES:
-        stats_text += f"🎉 Поздравляю! Ты выполнил цель! Обратись к администратору."
-    else:
-        stats_text += f"🎯 Осталось пригласить: {GOAL_INVITES - invites_count} чел."
-    
-    # Показываем список приглашенных
-    invites_list = execute_query(
-        "SELECT invited_username, invited_at FROM invites WHERE inviter_id = ? ORDER BY invited_at DESC LIMIT 10",
-        (user_id,)
-    ).fetchall()
-    
-    if invites_list:
-        stats_text += f"\n\n📋 Последние приглашенные:\n"
-        for i, (invited_username, invited_at) in enumerate(invites_list, 1):
-            stats_text += f"{i}. @{invited_username or 'скрыт'} ({invited_at[:10]})\n"
-    
-    bot.send_message(user_id, stats_text, parse_mode='Markdown')
-
-# ===== АДМИН-КОМАНДЫ =====
-@bot.message_handler(commands=['admin_stats'])
-def admin_stats(message):
-    """Показывает общую статистику (только для админов)"""
-    if message.from_user.username not in ADMIN_USERNAMES:
-        bot.send_message(message.chat.id, "❌ У вас нет прав для выполнения этой команды.")
+    # Проверяем, что пост из нужного канала
+    if message.chat.id != SOURCE_CHANNEL_ID:
         return
     
-    total_users = execute_query("SELECT COUNT(*) FROM users").fetchone()[0]
-    total_invites = execute_query("SELECT COUNT(*) FROM invites").fetchone()[0]
-    prize_winners = execute_query("SELECT COUNT(*) FROM users WHERE prize_received = 1").fetchone()[0]
+    # Пропускаем служебные сообщения
+    if hasattr(message, 'new_chat_members') or hasattr(message, 'left_chat_member'):
+        return
     
-    stats_text = f"📊 Общая статистика:\n\n"
-    stats_text += f"👥 Всего пользователей: {total_users}\n"
-    stats_text += f"🔗 Всего приглашений: {total_invites}\n"
-    stats_text += f"🎁 Получили приз: {prize_winners}\n"
+    logger.info(f"📨 Новый пост в канале {SOURCE_CHANNEL_ID}")
     
-    # Топ пригласивших
-    top_inviters = execute_query(
-        "SELECT user_id, username, invites_count FROM users ORDER BY invites_count DESC LIMIT 10"
-    ).fetchall()
-    
-    if top_inviters:
-        stats_text += f"\n🏆 Топ пригласивших:\n"
-        for i, (user_id, username, invites_count) in enumerate(top_inviters, 1):
-            stats_text += f"{i}. @{username or str(user_id)}: {invites_count} чел.\n"
-    
-    bot.send_message(message.chat.id, stats_text)
+    # Обрабатываем пост
+    await process_post(message, context)
 
-# ===== ЗАПУСК =====
-print("🚀 Запускаю бота...")
+async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик медиагрупп"""
+    message = update.channel_post
+    if not message:
+        return
+    
+    # Проверяем, что пост из нужного канала
+    if message.chat.id != SOURCE_CHANNEL_ID:
+        return
+    
+    media_group_id = getattr(message, 'media_group_id', None)
+    if not media_group_id:
+        return
+    
+    logger.info(f"📦 Медиагруппа в канале: {media_group_id}")
+    
+    # Для медиагрупп берем только первое фото или видео
+    # Поскольку каждое сообщение в медиагруппе приходит отдельно,
+    # мы обрабатываем только первое
+    
+    # Проверяем, есть ли фото в этом сообщении
+    if hasattr(message, 'photo') and message.photo:
+        logger.info(f"📸 Обработка первого фото из медиагруппы")
+        await process_post(message, context)
+    elif hasattr(message, 'video') and message.video:
+        logger.info(f"📹 Обработка первого видео из медиагруппы")
+        await process_post(message, context)
 
-while True:
+# ==================== ЗАПУСК ====================
+
+async def main():
+    logger.info("🚀 Бот для пересылки постов с оформлением запускается...")
+    
+    # Скачиваем шрифты
+    download_fonts()
+    
+    # Создаем приложение
+    app = Application.builder().token(BOT_TOKEN).build()
+    bot = Bot(token=BOT_TOKEN)
+    
+    # Проверяем доступ к каналам
     try:
-        bot.remove_webhook()
-        print("✅ Webhook удален перед запуском")
-        bot.polling(none_stop=True, interval=0, timeout=60)
-    except ApiTelegramException as e:
-        if "409" in str(e) or "Conflict" in str(e):
-            print(f"⚠️ Конфликт: {e}")
-            time.sleep(5)
-            continue
-        else:
-            print(f"❌ Ошибка API: {e}")
-            time.sleep(5)
+        source_channel = await bot.get_chat(SOURCE_CHANNEL_ID)
+        logger.info(f"✅ Подключен к каналу-источнику: {source_channel.title}")
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
-        time.sleep(5)
+        logger.error(f"❌ Ошибка доступа к каналу-источнику: {e}")
+        return
+    
+    try:
+        target_channel = await bot.get_chat(TARGET_CHANNEL_ID)
+        logger.info(f"✅ Подключен к целевому каналу: {target_channel.title}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка доступа к целевому каналу: {e}")
+        return
+    
+    # Удаляем webhook
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook удалён")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка удаления webhook: {e}")
+    
+    # Регистрируем обработчики
+    # Обработчик постов из канала
+    app.add_handler(MessageHandler(
+        filters.Chat(chat_id=SOURCE_CHANNEL_ID) & filters.ALL,
+        handle_channel_post
+    ))
+    
+    logger.info("✅ Обработчики зарегистрированы")
+    logger.info(f"📊 Параметры оформления (ЧП ВМ):")
+    logger.info(f"  • Размер: {TARGET_W}x{TARGET_H}")
+    logger.info(f"  • Градиент: {int(CHP_GRADIENT_PCT*100)}%")
+    logger.info(f"  • Затемнение: {int(BRIGHTNESS_FACTOR*100)}%")
+    logger.info(f"  • Текст: снизу")
+    logger.info(f"📢 Канал-источник: {SOURCE_CHANNEL_ID}")
+    logger.info(f"📢 Целевой канал: {TARGET_CHANNEL_ID}")
+    
+    # Запускаем бота
+    await app.initialize()
+    await app.start()
+    
+    await app.updater.start_polling(
+        allowed_updates=["channel_post"],
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30
+    )
+    
+    logger.info("🟢 Бот запущен и слушает канал!")
+    
+    # Бесконечный цикл
+    while True:
+        await asyncio.sleep(1)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"❌ Ошибка: {e}")
+        sys.exit(1)
